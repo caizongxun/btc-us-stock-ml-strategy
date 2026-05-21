@@ -4,11 +4,12 @@ python-binance>=1.0.19
 pandas>=2.1.0
 numpy>=1.26.0
 requests>=2.31.0
+python-dateutil>=2.9.0
 
 # features
 ta>=0.11.0
 scipy>=1.11.0
-sklearn-hmm>=0.1.0
+hmmlearn>=0.3.0
 
 # models
 xgboost>=2.0.0
