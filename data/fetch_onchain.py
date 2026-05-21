@@ -17,12 +17,13 @@ def fetch_fear_greed(days: int = CFG.lookback_days) -> pd.DataFrame:
     r.raise_for_status()
     data = r.json()["data"]
     df = pd.DataFrame(data)
-    df["date"] = pd.to_datetime(df["timestamp"], unit="s")
-    df = df.set_index("date")[["value","value_classification"]]
+    # Cast to int64 first to avoid pandas FutureWarning about string parsing with unit=
+    df["date"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="s")
+    df = df.set_index("date")[["value", "value_classification"]]
     df["fg_value"] = df["value"].astype(float)
     df["fg_extreme_fear"] = (df["fg_value"] < 25).astype(int)
     df["fg_extreme_greed"] = (df["fg_value"] > 75).astype(int)
-    df = df.drop(columns=["value","value_classification"]).sort_index()
+    df = df.drop(columns=["value", "value_classification"]).sort_index()
     df.to_parquet(cache_path)
     logger.info(f"Fear & Greed fetched: {len(df)} rows")
     return df
