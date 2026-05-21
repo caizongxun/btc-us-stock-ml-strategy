@@ -35,7 +35,6 @@ def train_xgboost(df: pd.DataFrame, label_col: str = "y_binary"):
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
             "gamma": trial.suggest_float("gamma", 0, 5),
             "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.5, 3.0),
-            "use_label_encoder": False,
             "eval_metric": "logloss",
             "random_state": 42,
             "n_jobs": -1,
@@ -47,8 +46,7 @@ def train_xgboost(df: pd.DataFrame, label_col: str = "y_binary"):
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=CFG.n_trials, show_progress_bar=True)
     best_params = study.best_params
-    best_params.update({"use_label_encoder": False, "eval_metric": "logloss",
-                        "random_state": 42, "n_jobs": -1})
+    best_params.update({"eval_metric": "logloss", "random_state": 42, "n_jobs": -1})
     logger.info(f"XGBoost best F1 (CV): {study.best_value:.4f}")
     logger.info(f"Best params: {best_params}")
 
