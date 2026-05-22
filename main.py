@@ -18,18 +18,18 @@ def parse_args():
 def main():
     args = parse_args()
     CFG.target_asset = args.asset
-    CFG.target_days = args.target_days
-    CFG.long_threshold = args.long_thresh
+    CFG.target_days  = args.target_days
+    CFG.long_threshold  = args.long_thresh
     CFG.short_threshold = abs(args.short_thresh)
 
     os.makedirs(CFG.output_dir, exist_ok=True)
-    os.makedirs(CFG.model_dir, exist_ok=True)
+    os.makedirs(CFG.model_dir,  exist_ok=True)
 
-    # Step 1: Build features
     logger.info("=" * 60)
     logger.info(f"Pipeline: asset={args.asset}, target={args.target_days}d, mode={args.mode}")
     logger.info("=" * 60)
 
+    # Step 1: Build features
     from features.build_features import build_feature_matrix
     df = build_feature_matrix(target_asset=args.asset, target_days=args.target_days)
 
@@ -37,33 +37,33 @@ def main():
     logger.info(f"Total features: {len(feature_cols)}")
 
     if args.mode in ["full", "regime_only"]:
-        # Regime detection already done inside build_feature_matrix
         logger.info("Regime detection: done (embedded in features)")
 
     if args.mode in ["full", "rules_only"]:
-        # Step 2: Train XGBoost
+        # Step 2: Train XGBoost — now returns best_threshold
         logger.info("Training XGBoost...")
         from models.xgboost_model import train_xgboost
-        xgb_model, shap_imp, (X_test, y_test, y_prob) = train_xgboost(df)
+        xgb_model, shap_imp, (X_test, y_test, y_prob), xgb_threshold = train_xgboost(df)
 
         # Step 3: Train LightGBM
         logger.info("Training LightGBM...")
         from models.lightgbm_model import train_lightgbm
         lgb_model, lgb_imp = train_lightgbm(df)
 
-        # Step 4: Mine binary rules from top SHAP features
+        # Step 4: Mine binary rules
         logger.info("Mining binary rules...")
         from models.binary_rule_miner import mine_binary_rules
         top_features = list(shap_imp.index[:30])
-        rule_result = mine_binary_rules(df, top_features)
+        rule_result  = mine_binary_rules(df, top_features)
 
-        # Step 5: Generate signals
+        # Step 5: Generate ML signal using the auto-tuned XGB threshold
         from strategy.signal_generator import generate_signal_from_prob
         import numpy as np, pandas as pd
-        signal_prob = generate_signal_from_prob(y_prob)
+        signal_prob = generate_signal_from_prob(y_prob, long_thresh=xgb_threshold)
+        logger.info(f"XGB signal using threshold={xgb_threshold:.3f}")
 
-        # Step 6: Multi-signal
-        test_df = df.iloc[int(len(df) * (1 - CFG.test_size)):].copy()
+        # Step 6: Multi-signal composite
+        test_df      = df.iloc[int(len(df) * (1 - CFG.test_size)):].copy()
         signal_series = pd.Series(signal_prob, index=test_df.index, name="signal")
         from strategy.multi_signal import build_multi_signal
         multi_sig, sig_components = build_multi_signal(test_df, signal_series)
@@ -79,8 +79,8 @@ def main():
             price_full = fetch_stocks([args.asset])[args.asset]["close"]
         price_test = price_full.reindex(test_df.index)
 
-        metrics_ml = evaluate_signal(price_test, signal_series, label="xgb_ml")
-        metrics_multi = evaluate_signal(price_test, multi_sig, label="multi_signal")
+        metrics_ml    = evaluate_signal(price_test, signal_series, label="xgb_ml")
+        metrics_multi = evaluate_signal(price_test, multi_sig,    label="multi_signal")
         logger.info(f"XGB Signal Metrics: {metrics_ml}")
         logger.info(f"Multi Signal Metrics: {metrics_multi}")
 
@@ -95,11 +95,12 @@ def main():
 
         # Save summary
         summary = {
-            "xgb_metrics": metrics_ml,
+            "xgb_metrics":          metrics_ml,
             "multi_signal_metrics": metrics_multi,
-            "top10_features": list(shap_imp.head(10).index),
-            "rule_f1": rule_result["test_f1"],
-            "rule_thresholds": rule_result["thresholds"],
+            "top10_features":       list(shap_imp.head(10).index),
+            "rule_f1":              rule_result["test_f1"],
+            "rule_thresholds":      rule_result["thresholds"],
+            "xgb_threshold":        xgb_threshold,
         }
         with open(os.path.join(CFG.output_dir, "pipeline_summary.json"), "w") as f:
             json.dump(summary, f, indent=2, default=str)
