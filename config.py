@@ -29,10 +29,16 @@ class Config:
     early_stopping_rounds: int = 50
     test_size: float = 0.2
 
-    # --- Signal ---
-    long_prob_threshold: float = 0.60
-    short_prob_threshold: float = 0.40
-    n_of_m_threshold: int = 3         # multi-signal: need 3 of M to fire
+    # --- Signal probability thresholds ---
+    # Lower than default 0.60 to get non-zero recall on minority class.
+    # The soft-fallback in model files will drop further to 0.45 if still 0.
+    long_prob_threshold: float = 0.52
+    short_prob_threshold: float = 0.48
+
+    # --- Multi-signal voting ---
+    # 3-of-8: fires when at least 3 sub-signals agree.
+    # Dynamic logic in multi_signal.py will lower this if fewer signals are available.
+    n_of_m_threshold: int = 3
 
     # --- Regime ---
     n_regimes: int = 3                # bull / sideways / bear

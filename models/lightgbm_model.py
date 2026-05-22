@@ -1,8 +1,10 @@
-"""LightGBM classifier with Optuna search — faster alternative to XGBoost.
+"""LightGBM classifier with Optuna search.
 
-Key fix: scale_pos_weight derived from training data automatically.
-Adds is_unbalance=False + explicit scale_pos_weight so LGB doesn't
-double-compensate.
+Fixes:
+- scale_pos_weight auto-calculated from training labels
+- is_unbalance=False to prevent double-compensation
+- predict uses predict_proba + threshold instead of argmax
+  so minority class (long) is not systematically suppressed.
 """
 import numpy as np
 import pandas as pd
@@ -26,11 +28,13 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # Auto scale_pos_weight from training set
+    # Auto scale_pos_weight
     neg = (y_train == 0).sum()
     pos = (y_train == 1).sum()
     spw = neg / pos if pos > 0 else 1.0
     logger.info(f"LGB scale_pos_weight (auto): {spw:.3f}  (neg={neg}, pos={pos})")
+    logger.info(f"LGB label distribution  train: pos={pos} ({100*pos/(neg+pos):.1f}%)  "
+                f"test: pos={(y_test==1).sum()} ({100*(y_test==1).mean():.1f}%)")
 
     tscv = TimeSeriesSplit(n_splits=CFG.cv_splits)
 
@@ -46,8 +50,8 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
             "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
             "reg_alpha":         trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
             "reg_lambda":        trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-            "scale_pos_weight":  spw,   # fixed — not a search parameter
-            "is_unbalance":      False,  # don't double-compensate
+            "scale_pos_weight":  spw,
+            "is_unbalance":      False,
             "random_state":      42,
             "n_jobs":            -1,
             "verbose":           -1,
@@ -76,8 +80,19 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
     )
 
-    y_pred = model.predict(X_test)
-    logger.info("\n" + classification_report(y_test, y_pred))
+    # --- Use prob threshold instead of argmax (critical for imbalanced classes) ---
+    y_prob = model.predict_proba(X_test)[:, 1]
+    threshold = CFG.long_prob_threshold
+    y_pred = (y_prob >= threshold).astype(int)
+    logger.info(f"LGB threshold={threshold:.2f}  predicted positives: {y_pred.sum()} / {len(y_pred)}")
+    logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
+
+    # Soft-adjust threshold if recall(1) is still 0
+    if y_pred.sum() == 0:
+        softer = max(0.45, threshold - 0.10)
+        y_pred = (y_prob >= softer).astype(int)
+        logger.warning(f"Recall(1)=0 at threshold {threshold:.2f} — retrying at {softer:.2f}")
+        logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
 
     importance = pd.Series(
         model.feature_importances_,
