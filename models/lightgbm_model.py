@@ -1,17 +1,23 @@
-"""LightGBM classifier with Optuna search.
+"""LightGBM classifier with Optuna search + CalibratedClassifierCV.
+
+Root cause of Recall(1)=0:
+  Optuna was scoring with 'f1' which evaluates predict() [argmax],
+  not predict_proba(). The model never learned to push P(1) above 0.45
+  because F1 doesn't penalize uncalibrated probabilities.
 
 Fixes:
-- scale_pos_weight auto-calculated from training labels
-- is_unbalance=False to prevent double-compensation
-- predict uses predict_proba + threshold instead of argmax
-  so minority class (long) is not systematically suppressed.
+  1. Optuna CV metric -> 'roc_auc' (threshold-free, optimises separation)
+  2. Final model wrapped with CalibratedClassifierCV (isotonic, cv=3)
+     so predict_proba() is properly calibrated
+  3. Threshold applied to calibrated probs
 """
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 import optuna
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.metrics import classification_report
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import classification_report, roc_auc_score
 from loguru import logger
 import joblib, os
 from config import CFG
@@ -33,7 +39,7 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     pos = (y_train == 1).sum()
     spw = neg / pos if pos > 0 else 1.0
     logger.info(f"LGB scale_pos_weight (auto): {spw:.3f}  (neg={neg}, pos={pos})")
-    logger.info(f"LGB label distribution  train: pos={pos} ({100*pos/(neg+pos):.1f}%)  "
+    logger.info(f"LGB label dist  train: pos={pos} ({100*pos/(neg+pos):.1f}%)  "
                 f"test: pos={(y_test==1).sum()} ({100*(y_test==1).mean():.1f}%)")
 
     tscv = TimeSeriesSplit(n_splits=CFG.cv_splits)
@@ -57,11 +63,14 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
             "verbose":           -1,
         }
         model = lgb.LGBMClassifier(**params)
-        scores = cross_val_score(model, X_train, y_train, cv=tscv, scoring="f1", n_jobs=1)
+        # roc_auc: threshold-free metric, optimises probability separation
+        scores = cross_val_score(model, X_train, y_train,
+                                 cv=tscv, scoring="roc_auc", n_jobs=1)
         return scores.mean()
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=CFG.n_trials, show_progress_bar=True)
+    logger.info(f"LightGBM best ROC-AUC (CV): {study.best_value:.4f}")
 
     best_params = {
         **study.best_params,
@@ -71,31 +80,41 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
         "n_jobs": -1,
         "verbose": -1,
     }
-    logger.info(f"LightGBM best F1 (CV): {study.best_value:.4f}")
 
-    model = lgb.LGBMClassifier(**best_params)
-    model.fit(
+    base_model = lgb.LGBMClassifier(**best_params)
+    base_model.fit(
         X_train, y_train,
         eval_set=[(X_test, y_test)],
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
     )
 
-    # --- Use prob threshold instead of argmax (critical for imbalanced classes) ---
+    # Calibrate probabilities with isotonic regression
+    # cv="prefit" uses the already-fitted base_model, no re-training
+    model = CalibratedClassifierCV(base_model, method="isotonic", cv="prefit")
+    model.fit(X_train, y_train)
+    logger.info("CalibratedClassifierCV (isotonic) fitted on training set")
+
+    # Evaluate with prob threshold
     y_prob = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, y_prob)
+    logger.info(f"LGB calibrated ROC-AUC (test): {auc:.4f}")
+    logger.info(f"LGB prob stats: min={y_prob.min():.3f} max={y_prob.max():.3f} "
+                f"mean={y_prob.mean():.3f} >0.5: {(y_prob>0.5).sum()}")
+
     threshold = CFG.long_prob_threshold
     y_pred = (y_prob >= threshold).astype(int)
     logger.info(f"LGB threshold={threshold:.2f}  predicted positives: {y_pred.sum()} / {len(y_pred)}")
+
+    if y_pred.sum() == 0:
+        # Find threshold at target recall
+        softer = float(np.percentile(y_prob, 80))  # top-20% by prob = long
+        y_pred = (y_prob >= softer).astype(int)
+        logger.warning(f"Recall(1)=0 at {threshold:.2f} — using percentile-80 threshold {softer:.3f}")
+
     logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
 
-    # Soft-adjust threshold if recall(1) is still 0
-    if y_pred.sum() == 0:
-        softer = max(0.45, threshold - 0.10)
-        y_pred = (y_prob >= softer).astype(int)
-        logger.warning(f"Recall(1)=0 at threshold {threshold:.2f} — retrying at {softer:.2f}")
-        logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
-
     importance = pd.Series(
-        model.feature_importances_,
+        base_model.feature_importances_,
         index=feature_cols,
     ).sort_values(ascending=False)
     logger.info(f"Top 20 LGB features:\n{importance.head(20).to_string()}")

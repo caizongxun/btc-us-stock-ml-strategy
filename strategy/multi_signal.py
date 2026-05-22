@@ -1,11 +1,10 @@
 """N-of-M signal voting — combine ML signal with rule-based conditions.
 
-Fix: lower default n_required to 2 (from 3) so multi_signal fires more often
-when the ML signal has low recall. Also add a fallback: if fewer than 3
-sub-signal columns are present, require only 1.
+Fix: add proper logger import; dynamic n_required; detailed vote logging.
 """
 import pandas as pd
 import numpy as np
+from loguru import logger
 from config import CFG
 
 
@@ -22,7 +21,7 @@ def build_multi_signal(
       -1  if vote_count < (total - n_required)  [strong disagreement]
        0  otherwise
     """
-    sub_signals: dict[str, pd.Series] = {}
+    sub_signals: dict = {}
 
     # 1. ML model signal
     sub_signals["ml_signal"] = (model_signal == 1).astype(int)
@@ -58,24 +57,28 @@ def build_multi_signal(
     signal_df = pd.DataFrame(sub_signals, index=df.index)
     n_total = len(sub_signals)
 
-    # Dynamic n_required: cfg default, or 2 if >= 4 signals, or 1 if < 3
+    # Dynamic n_required
     if n_required is None:
         if n_total >= 6:
-            n_required = CFG.n_of_m_threshold   # default = 3 out of 8
+            n_required = CFG.n_of_m_threshold   # default = 3
         elif n_total >= 4:
             n_required = 2
         else:
             n_required = 1
 
-    logger.info = __import__('loguru').logger.info  # local ref for safety
-    __import__('loguru').logger.info(
-        f"multi_signal: {n_total} sub-signals, requiring {n_required} to fire. "
-        f"Signal counts: { {k: int(v.sum()) for k, v in sub_signals.items()} }"
+    vote_counts = {k: int(v.sum()) for k, v in sub_signals.items()}
+    logger.info(
+        f"multi_signal: {n_total} sub-signals, requiring {n_required} to fire.\n"
+        f"  Vote counts: {vote_counts}"
     )
 
     vote_count = signal_df.sum(axis=1)
     final_signal = pd.Series(0, index=df.index)
     final_signal[vote_count >= n_required] = 1
     final_signal[vote_count < (n_total - n_required)] = -1
+
+    pos = (final_signal == 1).sum()
+    neg = (final_signal == -1).sum()
+    logger.info(f"  Final signal: long={pos}, short={neg}, flat={len(final_signal)-pos-neg}")
 
     return final_signal, signal_df
