@@ -23,17 +23,21 @@ from features.technical_features import add_technical_features
 from features.regime_features import detect_regime
 from config import CFG
 
+# Must survive SHAP pruning — used directly by multi_signal.py
 SIGNAL_COLS = [
-    "btc_trend_score",
-    "btc_regime_bear",
-    "btc_regime_sideways",
-    "btc_rsi14_ob",
-    "btc_vol_ma_ratio_14d",
-    "btc_vol_ma_ratio_7d",
-    "btc_SPY_corr_30d",
-    "fg_value",
-    "risk_on_score",
-    "vix_low",
+    "btc_trend_score",       # EMA alignment 0-3
+    "btc_regime_bear",       # HMM bear flag
+    "btc_regime_sideways",   # HMM sideways flag
+    "btc_rsi14_ob",          # RSI>70 flag
+    "btc_vol_ma_ratio_14d",  # volume surge
+    "btc_vol_ma_ratio_7d",   # volume surge fallback
+    "btc_SPY_corr_30d",      # BTC-SPY 30d corr
+    "fg_value",              # fear & greed value
+    "risk_on_score",         # composite risk-on percentile
+    "vix_low",               # VIX < 18 flag
+    "btc_price_vs_ema200",   # price / EMA200 - 1
+    "btc_ema200_slope",      # EMA200 slope (fallback for above)
+    "btc_GLD_div_5d",        # BTC-GLD 5d divergence (top SHAP feature)
 ]
 
 
@@ -64,12 +68,12 @@ def build_feature_matrix(
     top_k: int = CFG.top_k_features,
 ) -> pd.DataFrame:
     logger.info("Fetching data...")
-    btc = fetch_btc_ohlcv()          # 4h index
-    stocks = fetch_stocks()           # daily index
-    fg = fetch_fear_greed()           # daily index
+    btc    = fetch_btc_ohlcv()
+    stocks = fetch_stocks()
+    fg     = fetch_fear_greed()
 
     btc_index = btc.index
-    btc_daily = _resample_btc_daily(btc)   # daily — used for cross-asset only
+    btc_daily = _resample_btc_daily(btc)
 
     # ------------------------------------------------------------------ #
     # BTC 4h features
@@ -92,7 +96,7 @@ def build_feature_matrix(
         df = df.join(aligned, how="left")
 
     # ------------------------------------------------------------------ #
-    # Stock daily features (aligned to 4h)
+    # Stock daily features
     # ------------------------------------------------------------------ #
     if "^VIX" in stocks:
         vix_feats = add_vix_features(stocks["^VIX"])
@@ -117,29 +121,25 @@ def build_feature_matrix(
         join_daily(qqq_feats)
 
     # ------------------------------------------------------------------ #
-    # Cross-asset features — computed on DAILY BTC to match stock index
+    # Cross-asset features on DAILY BTC
     # ------------------------------------------------------------------ #
     logger.info("Building cross-asset features on daily BTC...")
     stocks_no_vix = {k: v for k, v in stocks.items() if k != "^VIX"}
     cross = add_cross_asset_features(btc_daily, stocks_no_vix)
-
-    # cross is on daily index — forward-fill to 4h
-    logger.info(f"Cross-asset features: {cross.shape[1]} cols, {cross.notna().mean().describe()}")
     join_daily(cross)
 
-    # Spot-check: log NaN rate for key signal cols before fillna
-    for col in ["btc_SPY_corr_30d", "risk_on_score"]:
+    for col in ["btc_SPY_corr_30d", "risk_on_score", "btc_GLD_div_5d"]:
         if col in df.columns:
             nan_pct = df[col].isna().mean() * 100
-            logger.info(f"  {col}: NaN rate before fillna = {nan_pct:.1f}%")
+            logger.info(f"  {col}: NaN={nan_pct:.1f}%")
 
     # ------------------------------------------------------------------ #
     # Fear & Greed
     # ------------------------------------------------------------------ #
     fg_aligned = _align_daily_to_intraday(fg, btc_index)
     df = df.join(fg_aligned, how="left")
-    df["fg_value"] = df["fg_value"].ffill()
-    df["fg_extreme_fear"] = df["fg_extreme_fear"].ffill().fillna(0)
+    df["fg_value"]         = df["fg_value"].ffill()
+    df["fg_extreme_fear"]  = df["fg_extreme_fear"].ffill().fillna(0)
     df["fg_extreme_greed"] = df["fg_extreme_greed"].ffill().fillna(0)
 
     # ------------------------------------------------------------------ #
@@ -147,25 +147,21 @@ def build_feature_matrix(
     # ------------------------------------------------------------------ #
     fwd_ret = btc["close"].pct_change(target_days).shift(-target_days)
     if target_asset != "BTC":
-        daily_fwd = (
-            stocks[target_asset]["close"].pct_change(target_days).shift(-target_days)
-        )
+        daily_fwd = stocks[target_asset]["close"].pct_change(target_days).shift(-target_days)
         fwd_ret = _align_daily_to_intraday(daily_fwd.to_frame("fwd"), btc_index)["fwd"]
 
-    df["fwd_ret"] = fwd_ret
-    df["y"] = 0
-    df.loc[fwd_ret > CFG.long_threshold, "y"] = 1
+    df["fwd_ret"]  = fwd_ret
+    df["y"]        = 0
+    df.loc[fwd_ret >  CFG.long_threshold,  "y"] = 1
     df.loc[fwd_ret < -CFG.short_threshold, "y"] = -1
     df["y_binary"] = (df["y"] == 1).astype(int)
 
-    # Drop raw OHLCV
     raw_cols = [
         c for c in ["open", "high", "low", "close", "volume",
                     "taker_buy_base", "taker_buy_quote", "fwd_ret"]
         if c in df.columns
     ]
     df = df.drop(columns=raw_cols)
-
     df = df.dropna(subset=["y", "y_binary"])
     thresh = int(0.5 * len(df.columns))
     df = df.dropna(thresh=thresh)
@@ -197,31 +193,25 @@ def _shap_feature_selection(
     spw = neg / pos if pos > 0 else 1.0
 
     quick_model = xgb.XGBClassifier(
-        n_estimators=100,
-        max_depth=4,
-        learning_rate=0.1,
-        scale_pos_weight=spw,
-        eval_metric="logloss",
-        random_state=42,
-        n_jobs=-1,
+        n_estimators=100, max_depth=4, learning_rate=0.1,
+        scale_pos_weight=spw, eval_metric="logloss",
+        random_state=42, n_jobs=-1,
     )
     quick_model.fit(X_tr, y_tr)
 
-    explainer = shap.TreeExplainer(quick_model)
-    shap_vals = explainer.shap_values(X_tr)
+    explainer  = shap.TreeExplainer(quick_model)
+    shap_vals  = explainer.shap_values(X_tr)
     importance = pd.Series(
-        np.abs(shap_vals).mean(axis=0),
-        index=feature_cols,
+        np.abs(shap_vals).mean(axis=0), index=feature_cols
     ).sort_values(ascending=False)
 
     present_signal_cols = [c for c in SIGNAL_COLS if c in feature_cols]
     top_features = importance.head(top_k).index.tolist()
-    all_keep = list(dict.fromkeys(top_features + present_signal_cols))
+    all_keep     = list(dict.fromkeys(top_features + present_signal_cols))
 
     n_added = len([c for c in present_signal_cols if c not in top_features])
     logger.info(
-        f"SHAP selection: top {top_k} + {n_added} forced signal cols = {len(all_keep)} total"
+        f"SHAP: top {top_k} + {n_added} forced signal cols = {len(all_keep)} total"
     )
-
     keep_cols = all_keep + ["y", "y_binary"]
     return df[keep_cols]
