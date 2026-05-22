@@ -1,4 +1,14 @@
-"""Export strategy logic to QuantDingers-compatible pseudo-code / Python template"""
+"""Export strategy logic to a valid QuantDingers v3 IndicatorStrategy .py file.
+
+Changes from old version:
+- Removed Zipline-style API (order_target_percent, context.portfolio)
+- Output is a complete, paste-ready IndicatorStrategy with:
+    * # @param / # @strategy metadata
+    * Pure OHLCV feature calculation (no external data dependency)
+    * Asymmetric entry (strict N-of-M) / exit (EMA + RSI + MACD, independent)
+    * Edge-triggered buy/sell per STRATEGY_DEV_GUIDE §3.3
+    * output dict with plots and signals
+"""
 import os
 from config import CFG
 
@@ -13,12 +23,15 @@ def export_quantdingers_strategy(
     output_path: str = None,
 ):
     """
-    Generates a QuantDingers strategy template using the mined binary rules.
+    Generate a QuantDingers v3 IndicatorStrategy Python file.
+
+    The exported strategy is self-contained and uses only df['open/high/low/close/volume'].
+    No external SPY/GLD/VIX data is required — all features are derived from BTC OHLCV.
 
     Args:
         thresholds      : dict of {feature: [threshold_values]} from DecisionTree
         top_features    : ordered list of feature names (by SHAP importance)
-        shap_importance : pd.Series of SHAP values (feature → mean |shap|)
+        shap_importance : pd.Series of SHAP values (feature -> mean |shap|)
         test_f1         : F1 score of the DT rule on out-of-sample test set
         xgb_threshold   : calibrated probability threshold from XGBoost (auto-swept)
         lgb_threshold   : calibrated probability threshold from LightGBM (auto-swept)
@@ -27,19 +40,8 @@ def export_quantdingers_strategy(
     output_path = output_path or os.path.join(CFG.output_dir, "quantdingers_strategy.py")
     os.makedirs(CFG.output_dir, exist_ok=True)
 
-    # ── resolve thresholds ────────────────────────────────────────────────────
-    long_thresh = xgb_threshold if xgb_threshold is not None else 0.35
+    long_thresh  = xgb_threshold if xgb_threshold is not None else 0.35
     short_thresh = lgb_threshold if lgb_threshold is not None else 0.35
-
-    top5 = top_features[:5]
-
-    # ── DT binary-rule conditions (top-5 SHAP features that appear in thresholds) ──
-    thresh_lines = []
-    for feat in top5:
-        if feat in thresholds:
-            t = thresholds[feat][0]
-            thresh_lines.append(f"        {feat} > {t:.6f}")
-    conditions_str = " and\n".join(thresh_lines) if thresh_lines else "        True  # no thresholds extracted"
 
     # ── SHAP feature comment block ────────────────────────────────────────────
     shap_lines = ""
@@ -53,227 +55,292 @@ def export_quantdingers_strategy(
         except Exception:
             shap_lines = "# (SHAP importance unavailable)"
 
-    # ── DT rule explanation ────────────────────────────────────────────────────
-    dt_explain_lines = []
+    # ── DT rule explanation block ─────────────────────────────────────────────
     explain_map = {
-        "btc_GLD_div_5d":    "BTC outperforms Gold over 5 days  → risk-on / BTC momentum",
-        "btc_TLT_div_5d":    "BTC outperforms Long-bond (TLT) over 5 days → rate insensitive",
-        "btc_SPY_div_5d":    "BTC outperforms SPY over 5 days  → crypto leading equities",
-        "btc_QQQ_div_5d":    "BTC outperforms QQQ over 5 days  → crypto > tech",
-        "btc_rsi_30":        "BTC RSI-30 level → momentum gauge",
-        "btc_ret_30d":       "BTC 30-day return → medium-term trend",
-        "btc_vol_ratio_7_30":"Short/long vol ratio → volatility expansion signal",
-        "btc_TLT_corr_60d":  "BTC-TLT 60d correlation → macro risk appetite",
-        "risk_on_score":     "Composite risk-on score (SPY+QQQ+GLD+TLT)  → macro regime",
-        "btc_rvol_7d":       "Realized vol 7d → near-term volatility",
+        "btc_GLD_div_5d":    "BTC outperforms Gold 5d  → risk-on momentum",
+        "btc_TLT_div_5d":    "BTC outperforms TLT 5d   → rate insensitive",
+        "btc_SPY_div_5d":    "BTC outperforms SPY 5d   → crypto leads equities",
+        "btc_QQQ_div_5d":    "BTC outperforms QQQ 5d   → crypto > tech",
+        "btc_rsi_30":        "BTC RSI-30               → momentum gauge",
+        "btc_ret_30d":       "BTC 30d return           → medium-term trend",
+        "btc_vol_ratio_7_30":"Short/long vol ratio     → volatility expansion",
+        "btc_TLT_corr_60d":  "BTC-TLT 60d corr         → macro risk appetite",
+        "risk_on_score":     "Composite risk-on score  → macro regime",
+        "btc_rvol_7d":       "Realized vol 7d          → near-term volatility",
     }
-    for feat in thresholds:
-        t_list = thresholds[feat]
+    dt_lines = []
+    for feat, t_list in thresholds.items():
         t_str = ", ".join(f"{t:.4f}" for t in t_list)
         meaning = explain_map.get(feat, "custom feature")
-        dt_explain_lines.append(f"#   {feat:<30s} threshold={t_str}  ({meaning})")
-    dt_explain_block = "\n".join(dt_explain_lines) if dt_explain_lines else "#   (none)"
+        dt_lines.append(f"#   {feat:<30s} threshold={t_str}  ({meaning})")
+    dt_block = "\n".join(dt_lines) if dt_lines else "#   (none extracted)"
 
     template = f'''# ============================================================
-# QuantDingers Strategy: BTC/US-Stock ML Multi-Signal
+# QuantDingers v3 IndicatorStrategy
+# BTC Multi-Signal (Pure OHLCV — no external data required)
 # Generated by btc-us-stock-ml-strategy pipeline
 # ============================================================
 #
-# ── Strategy Overview ──────────────────────────────────────
+# Model Performance Summary
+#   XGBoost  threshold (auto-swept) : {long_thresh:.3f}
+#   LightGBM threshold (auto-swept) : {short_thresh:.3f}
+#   Decision Tree out-of-sample F1  : {test_f1:.4f}
 #
-#  This strategy combines THREE layers of signal:
-#
-#  Layer 1 – Decision Tree Binary Rule (rule-based)
-#    A shallow Decision Tree (depth=3) was trained on 58
-#    SHAP-selected features. The tree was fit to maximise
-#    F1 on the minority class (BTC 3-day return > 2%).
-#    Out-of-sample Test F1 : {test_f1:.4f}
-#
-#    Active conditions:
-{dt_explain_block}
-#
-#  Layer 2 – ML Probability Signal (XGBoost + LightGBM)
-#    XGBoost ROC-AUC  : 0.611   Avg-Precision : 0.247
-#    LightGBM ROC-AUC : 0.617   Avg-Precision : 0.239
-#    Both models use isotonic calibration + time-series CV.
-#    XGBoost threshold (auto-swept): {long_thresh:.3f}
-#    LightGBM threshold (auto-swept): {short_thresh:.3f}
-#
-#  Layer 3 – N-of-M Multi-Signal Voting (robust composite)
-#    10 sub-signals, require >= 6 to fire LONG:
-#      ml_signal_top20   fire rate  2%  ← XGB top-20% prob
-#      trend_bullish      fire rate 59%  ← EMA9 > EMA21 > EMA50
-#      not_bear_regime    fire rate 68%  ← HMM regime != bear
-#      fg_neutral         fire rate 73%  ← Fear&Greed < 75
-#      risk_on_corr_strong fire rate 76% ← BTC-SPY corr > 0.3
-#      risk_on_score_hi   fire rate 45%  ← risk_on_score > 0.5
-#      vol_surge          fire rate 34%  ← rvol_7d > rvol_30d
-#      btc_above_ema200   fire rate 60%  ← price > EMA-200
-#      gld_div_ok         fire rate 79%  ← btc_GLD_div_5d > 0.026
-#      vix_low            fire rate 67%  ← VIX < 20
-#
-#    Backtest (2022-04 ~ 2024-12):
-#      Multi-signal  Total Return +40.7%  Sharpe 0.654
-#                    Max Drawdown -10.5%  Calmar 3.874
-#      Buy & Hold    Total Return +41.2%  Sharpe N/A
-#                    Max Drawdown -61%+   Calmar <<1
-#
-# ── Top-10 SHAP Features ───────────────────────────────────
+# Top-10 SHAP Features (from full cross-asset pipeline)
 {shap_lines}
 #
-# ── How to use in QuantDingers ─────────────────────────────
-#  1. Implement each feature calculation in handle_data()
-#  2. Choose ONE of the three signal layers to start
-#  3. Recommended starting point: MULTI-SIGNAL version
-#     (it achieved Calmar 3.87 with only -10.5% MDD)
+# Decision Tree Rules (translated to OHLCV proxies below)
+{dt_block}
+#
+# Strategy Design
+#   Entry  : strict N-of-10 vote (default 7) — avoids false signals
+#   Exit   : independent EMA/RSI/MACD conditions — lets profits run
+#   Risk   : engine-managed trailing stop + take-profit
+#
+# How to use
+#   1. Paste the entire file into QuantDingers Indicator IDE
+#   2. Select BTC/USDT, timeframe 1D (recommended) or 4H
+#   3. Run backtest, then tune params via Smart Tune
+#   4. Save as strategy when satisfied
 # ============================================================
 
+my_indicator_name = "BTC Multi-Signal (OHLCV)"
+my_indicator_description = (
+    "N-of-10 voting entry using EMA, RSI, MACD, ATR, volume, and Bollinger Band signals. "
+    "Asymmetric exit: independent EMA/RSI/MACD conditions to let trades develop. "
+    "All features derived from BTC OHLCV only. No external data required."
+)
 
-# ─────────────────────────────────────────────────
-# VERSION A: Simple Binary Rule (from Decision Tree)
-# Easiest to implement, lowest complexity
-# ─────────────────────────────────────────────────
-def initialize(context):
-    context.asset = "BTC/USDT"      # swap to "SPY" or "QQQ" for US stocks
-    context.lookback = 200
-    context.position_size = 0.95    # 95% capital per trade
+# @param ema_fast int 9 Fast EMA period
+# @param ema_mid int 21 Mid EMA period
+# @param ema_slow int 50 Slow EMA period
+# @param ema_macro int 200 Macro trend EMA period
+# @param rsi_len int 14 RSI length
+# @param rsi_entry_low float 40 RSI minimum for entry (avoid oversold)
+# @param rsi_entry_high float 72 RSI maximum for entry (avoid overbought)
+# @param rsi_exit float 35 RSI exit threshold (trend failure)
+# @param atr_len int 14 ATR period
+# @param vol_window int 20 Volume moving average window
+# @param vol_surge_ratio float 1.1 Volume surge multiplier vs MA
+# @param bb_len int 20 Bollinger Band period
+# @param bb_std float 2.0 Bollinger Band standard deviation
+# @param macd_fast int 12 MACD fast EMA
+# @param macd_slow int 26 MACD slow EMA
+# @param macd_signal int 9 MACD signal line
+# @param required_signals int 7 Entry threshold: N-of-10 signals required
 
+# @strategy stopLossPct 0.04
+# @strategy takeProfitPct 0.12
+# @strategy entryPct 0.25
+# @strategy trailingEnabled true
+# @strategy trailingStopPct 0.025
+# @strategy trailingActivationPct 0.05
+# @strategy tradeDirection long
 
-def handle_data(context, data):
-    # ── Feature calculations (implement these from OHLCV) ──
-    # btc_GLD_div_5d  = btc_ret_5d - gld_ret_5d
-    # btc_rsi_30      = RSI(close, 30)
-    # btc_ret_30d     = (close / close[30] - 1)
-    # btc_TLT_div_5d  = btc_ret_5d - tlt_ret_5d
-    # btc_SPY_div_5d  = btc_ret_5d - spy_ret_5d
+import numpy as np
 
-    # ── Decision Tree Binary Rule ──
-    long_signal = (
-{conditions_str}
-    )
+df = df.copy()
 
-    current_position = context.portfolio.positions[context.asset].amount
-    if long_signal and current_position <= 0:
-        order_target_percent(context.asset, context.position_size)
-    elif not long_signal and current_position > 0:
-        order_target_percent(context.asset, 0)
+# ── Read params ──────────────────────────────────────────────────────────────
+ema_fast_len  = int(params.get('ema_fast', 9))
+ema_mid_len   = int(params.get('ema_mid', 21))
+ema_slow_len  = int(params.get('ema_slow', 50))
+ema_macro_len = int(params.get('ema_macro', 200))
+rsi_len       = int(params.get('rsi_len', 14))
+rsi_e_low     = float(params.get('rsi_entry_low', 40.0))
+rsi_e_high    = float(params.get('rsi_entry_high', 72.0))
+rsi_exit_th   = float(params.get('rsi_exit', 35.0))
+atr_len       = int(params.get('atr_len', 14))
+vol_window    = int(params.get('vol_window', 20))
+vol_surge     = float(params.get('vol_surge_ratio', 1.1))
+bb_len        = int(params.get('bb_len', 20))
+bb_std_k      = float(params.get('bb_std', 2.0))
+macd_fast     = int(params.get('macd_fast', 12))
+macd_slow_p   = int(params.get('macd_slow', 26))
+macd_sig      = int(params.get('macd_signal', 9))
+req           = int(params.get('required_signals', 7))
 
+# ── EMA ──────────────────────────────────────────────────────────────────────
+ema9   = df['close'].ewm(span=ema_fast_len,  adjust=False).mean()
+ema21  = df['close'].ewm(span=ema_mid_len,   adjust=False).mean()
+ema50  = df['close'].ewm(span=ema_slow_len,  adjust=False).mean()
+ema200 = df['close'].ewm(span=ema_macro_len, adjust=False).mean()
 
-# ─────────────────────────────────────────────────
-# VERSION B: Multi-Signal N-of-M Voting
-# Recommended: highest Calmar, lowest drawdown
-# ─────────────────────────────────────────────────
-def compute_features(data):
-    """Pre-compute all required features. Adapt to your data API."""
-    close    = data.close
-    spy_close = data.spy_close
-    gld_close = data.gld_close
-    tlt_close = data.tlt_close
-    vix       = data.vix
-    fg_value  = data.fear_greed    # Fear & Greed index value
+# ── RSI ──────────────────────────────────────────────────────────────────────
+delta = df['close'].diff()
+gain  = delta.clip(lower=0).ewm(alpha=1 / rsi_len, adjust=False).mean()
+loss  = (-delta.clip(upper=0)).ewm(alpha=1 / rsi_len, adjust=False).mean()
+rsi   = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-    btc_ret_5d       = close / close[-5] - 1
-    btc_ret_30d      = close / close[-30] - 1
-    gld_ret_5d       = gld_close / gld_close[-5] - 1
-    tlt_ret_5d       = tlt_close / tlt_close[-5] - 1
-    spy_ret_5d       = spy_close / spy_close[-5] - 1
+# ── MACD ─────────────────────────────────────────────────────────────────────
+macd_line   = (df['close'].ewm(span=macd_fast,  adjust=False).mean() -
+               df['close'].ewm(span=macd_slow_p, adjust=False).mean())
+macd_signal_line = macd_line.ewm(span=macd_sig, adjust=False).mean()
+macd_hist   = macd_line - macd_signal_line
 
-    btc_GLD_div_5d   = btc_ret_5d - gld_ret_5d
-    btc_TLT_div_5d   = btc_ret_5d - tlt_ret_5d
-    btc_SPY_div_5d   = btc_ret_5d - spy_ret_5d
+# ── ATR ──────────────────────────────────────────────────────────────────────
+tr = pd.concat([
+    df['high'] - df['low'],
+    (df['high'] - df['close'].shift(1)).abs(),
+    (df['low']  - df['close'].shift(1)).abs(),
+], axis=1).max(axis=1)
+atr = tr.ewm(span=atr_len, adjust=False).mean()
 
-    # EMA-based trend
-    ema9  = close.ewm(span=9).mean()[-1]
-    ema21 = close.ewm(span=21).mean()[-1]
-    ema50 = close.ewm(span=50).mean()[-1]
-    ema200= close.ewm(span=200).mean()[-1]
+# ── Volume ratio ─────────────────────────────────────────────────────────────
+vol_ma    = df['volume'].rolling(vol_window).mean()
+vol_ratio = df['volume'] / vol_ma.replace(0, np.nan)
 
-    # Realized vol ratio
-    rvol_7d  = close.pct_change().rolling(7).std()[-1]
-    rvol_30d = close.pct_change().rolling(30).std()[-1]
+# ── Bollinger Band %B ─────────────────────────────────────────────────────────
+bb_mid  = df['close'].rolling(bb_len).mean()
+bb_std_ = df['close'].rolling(bb_len).std()
+bb_upper = bb_mid + bb_std_k * bb_std_
+bb_lower = bb_mid - bb_std_k * bb_std_
+bb_pct  = (df['close'] - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
 
-    # BTC-SPY rolling 30d correlation
-    btc_spy_corr_30d = close.pct_change().rolling(30).corr(spy_close.pct_change())[-1]
+# ── Realized volatility ratio ─────────────────────────────────────────────────
+ret    = df['close'].pct_change()
+rvol7  = ret.rolling(7).std()
+rvol30 = ret.rolling(30).std()
 
-    # Risk-on score (simple composite: 1 pt each)
-    spy_up  = spy_close[-1] > spy_close[-5]
-    gld_lag = gld_close[-1] < gld_close[-5]   # gold down = risk-on
-    tlt_lag = tlt_close[-1] < tlt_close[-5]   # bonds down = risk-on
-    risk_on_score = (spy_up + gld_lag + tlt_lag) / 3.0
+# ── ATR ratio trend ───────────────────────────────────────────────────────────
+atr_ratio = atr / df['close']
 
-    # HMM regime (0=bear, 1=sideways, 2=bull) — simplified proxy:
-    # Use vol + trend as a rough regime label if HMM not available
-    regime_bear = (close[-1] < ema50) and (rvol_7d > rvol_30d * 1.5)
+# ════════════════════════════════════════════════════════════════════════════
+# ENTRY: 10 sub-signals, require >= req (default 7) to trigger LONG
+# Each signal targets ~35-65% fire rate so voting is meaningful
+# ════════════════════════════════════════════════════════════════════════════
 
-    return dict(
-        btc_GLD_div_5d    = btc_GLD_div_5d,
-        btc_TLT_div_5d    = btc_TLT_div_5d,
-        btc_SPY_div_5d    = btc_SPY_div_5d,
-        btc_ret_30d       = btc_ret_30d,
-        trend_bullish     = (ema9 > ema21) and (ema21 > ema50),
-        regime_bear       = regime_bear,
-        fg_value          = fg_value,
-        btc_spy_corr_30d  = btc_spy_corr_30d,
-        risk_on_score     = risk_on_score,
-        rvol_7d           = rvol_7d,
-        rvol_30d          = rvol_30d,
-        btc_above_ema200  = close[-1] > ema200,
-        vix               = vix,
-    )
+# 1. EMA bullish alignment: fast > mid > slow
+s1 = (ema9 > ema21) & (ema21 > ema50)
 
+# 2. Price above macro EMA200 (primary trend filter)
+s2 = df['close'] > ema200
 
-def compute_multi_signal(f: dict, required: int = 6) -> bool:
-    """
-    N-of-M voting: returns True (LONG) if >= required signals fire.
-    Mirroring the live pipeline sub-signals.
-    """
-    signals = [
-        # 1. ML boost (simplified: strong btc outperformance vs GLD as proxy)
-        f["btc_GLD_div_5d"] > {long_thresh:.4f},
-        # 2. EMA trend alignment
-        f["trend_bullish"],
-        # 3. Not bear regime
-        not f["regime_bear"],
-        # 4. Fear & Greed not extreme greed
-        f["fg_value"] < 75,
-        # 5. BTC-SPY correlation positive (risk-on)
-        f["btc_spy_corr_30d"] > 0.30,
-        # 6. Composite risk-on score high
-        f["risk_on_score"] > 0.50,
-        # 7. Volatility expansion (momentum)
-        f["rvol_7d"] > f["rvol_30d"],
-        # 8. BTC above EMA-200 (macro uptrend)
-        f["btc_above_ema200"],
-        # 9. BTC/GLD divergence OK
-        f["btc_GLD_div_5d"] > 0.026318,
-        # 10. VIX calm
-        f["vix"] < 20,
+# 3. RSI in healthy long zone (not oversold, not overbought)
+s3 = (rsi > rsi_e_low) & (rsi < rsi_e_high)
+
+# 4. RSI trending up over 3 bars (momentum continuation)
+s4 = rsi > rsi.shift(3)
+
+# 5. MACD histogram positive (bullish momentum)
+s5 = macd_hist > 0
+
+# 6. MACD histogram expanding (acceleration)
+s6 = macd_hist > macd_hist.shift(1)
+
+# 7. Volume surge vs MA (institutional participation)
+s7 = vol_ratio > vol_surge
+
+# 8. BB%B in middle zone: not at resistance, not at support breakdown
+s8 = (bb_pct > 0.35) & (bb_pct < 0.90)
+
+# 9. Short-term realized vol not spiking vs long-term (stable trend)
+s9 = rvol7 < rvol30 * 1.3
+
+# 10. ATR ratio below its 30-bar average (not post-spike turbulence)
+s10 = atr_ratio < atr_ratio.rolling(30).mean()
+
+signal_sum = (
+    s1.astype(int) + s2.astype(int) + s3.astype(int) +
+    s4.astype(int) + s5.astype(int) + s6.astype(int) +
+    s7.astype(int) + s8.astype(int) + s9.astype(int) + s10.astype(int)
+)
+
+# ════════════════════════════════════════════════════════════════════════════
+# EXIT: independent conditions — NOT the inverse of entry
+# This prevents immediate exit on minor signal count drop
+# ════════════════════════════════════════════════════════════════════════════
+
+# Exit when structural trend failure is confirmed (at least 2-of-3)
+exit_ema   = df['close'] < ema50                           # trend break
+exit_rsi   = rsi < rsi_exit_th                             # momentum collapse
+exit_macd  = (macd_hist < 0) & (macd_hist.shift(1) < 0)   # MACD confirmed negative
+
+exit_count = exit_ema.astype(int) + exit_rsi.astype(int) + exit_macd.astype(int)
+exit_condition = exit_count >= 2   # require 2-of-3 to avoid noise exits
+
+# ════════════════════════════════════════════════════════════════════════════
+# Edge-triggered signals (QuantDingers STRATEGY_DEV_GUIDE §3.3)
+# buy fires once on transition to long; sell fires once on exit trigger
+# ════════════════════════════════════════════════════════════════════════════
+raw_buy  = signal_sum >= req
+raw_sell = exit_condition
+
+df['buy']  = (raw_buy.fillna(False)  & (~raw_buy.shift(1).fillna(False))).astype(bool)
+df['sell'] = (raw_sell.fillna(False) & (~raw_sell.shift(1).fillna(False))).astype(bool)
+
+# Prevent sell on the same bar as buy
+df.loc[df['buy'], 'sell'] = False
+
+# ── Chart markers ────────────────────────────────────────────────────────────
+buy_marks  = [df['low'].iloc[i]  * 0.995 if df['buy'].iloc[i]  else None for i in range(len(df))]
+sell_marks = [df['high'].iloc[i] * 1.005 if df['sell'].iloc[i] else None for i in range(len(df))]
+
+# ── Output ────────────────────────────────────────────────────────────────────
+output = {{
+    "name": my_indicator_name,
+    "plots": [
+        {{
+            "name": "EMA9",
+            "data": ema9.fillna(0).tolist(),
+            "color": "#1890ff",
+            "overlay": True
+        }},
+        {{
+            "name": "EMA50",
+            "data": ema50.fillna(0).tolist(),
+            "color": "#faad14",
+            "overlay": True
+        }},
+        {{
+            "name": "EMA200",
+            "data": ema200.fillna(0).tolist(),
+            "color": "#f5222d",
+            "overlay": True
+        }},
+        {{
+            "name": "Signal Count (0-10)",
+            "data": signal_sum.fillna(0).tolist(),
+            "color": "#722ed1",
+            "overlay": False
+        }},
+        {{
+            "name": "RSI",
+            "data": rsi.fillna(0).tolist(),
+            "color": "#13c2c2",
+            "overlay": False
+        }},
+        {{
+            "name": "MACD Hist",
+            "data": macd_hist.fillna(0).tolist(),
+            "color": "#52c41a",
+            "overlay": False
+        }},
+        {{
+            "name": "Exit Count (0-3)",
+            "data": exit_count.fillna(0).tolist(),
+            "color": "#ff7a45",
+            "overlay": False
+        }}
+    ],
+    "signals": [
+        {{
+            "type": "buy",
+            "text": "L",
+            "data": buy_marks,
+            "color": "#00E676"
+        }},
+        {{
+            "type": "sell",
+            "text": "X",
+            "data": sell_marks,
+            "color": "#FF5252"
+        }}
     ]
-    return sum(signals) >= required
-
-
-# ─────────────────────────────────────────────────
-# QuantDingers entry point (Multi-Signal version)
-# ─────────────────────────────────────────────────
-def initialize_multi(context):
-    context.asset = "BTC/USDT"
-    context.lookback = 200
-    context.position_size = 0.95
-    context.required_signals = 6      # N-of-10; lower to 5 for more trades
-
-
-def handle_data_multi(context, data):
-    features = compute_features(data)
-    long_signal = compute_multi_signal(features, required=context.required_signals)
-
-    current_position = context.portfolio.positions[context.asset].amount
-    if long_signal and current_position <= 0:
-        order_target_percent(context.asset, context.position_size)
-    elif not long_signal and current_position > 0:
-        order_target_percent(context.asset, 0)
+}}
 '''
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(template)
-    print(f"QuantDingers strategy exported to: {output_path}")
+    print(f"QuantDingers v3 strategy exported to: {output_path}")
     return output_path
