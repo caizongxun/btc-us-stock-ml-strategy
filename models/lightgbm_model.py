@@ -1,15 +1,7 @@
-"""LightGBM classifier with Optuna search + CalibratedClassifierCV.
+"""LightGBM classifier with Optuna + manual prob calibration.
 
-Root cause of Recall(1)=0:
-  Optuna was scoring with 'f1' which evaluates predict() [argmax],
-  not predict_proba(). The model never learned to push P(1) above 0.45
-  because F1 doesn't penalize uncalibrated probabilities.
-
-Fixes:
-  1. Optuna CV metric -> 'roc_auc' (threshold-free, optimises separation)
-  2. Final model wrapped with CalibratedClassifierCV (isotonic, cv=3)
-     so predict_proba() is properly calibrated
-  3. Threshold applied to calibrated probs
+Fix: cv='prefit' unsupported in this sklearn version.
+Same pattern as xgboost_model.py: fit on 80% of train, calibrate on 20%.
 """
 import numpy as np
 import pandas as pd
@@ -34,7 +26,6 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # Auto scale_pos_weight
     neg = (y_train == 0).sum()
     pos = (y_train == 1).sum()
     spw = neg / pos if pos > 0 else 1.0
@@ -62,9 +53,8 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
             "n_jobs":            -1,
             "verbose":           -1,
         }
-        model = lgb.LGBMClassifier(**params)
-        # roc_auc: threshold-free metric, optimises probability separation
-        scores = cross_val_score(model, X_train, y_train,
+        m = lgb.LGBMClassifier(**params)
+        scores = cross_val_score(m, X_train, y_train,
                                  cv=tscv, scoring="roc_auc", n_jobs=1)
         return scores.mean()
 
@@ -81,20 +71,22 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
         "verbose": -1,
     }
 
+    calib_split = int(len(X_train) * 0.8)
+    X_fit, X_calib = X_train[:calib_split], X_train[calib_split:]
+    y_fit, y_calib = y_train[:calib_split], y_train[calib_split:]
+
     base_model = lgb.LGBMClassifier(**best_params)
     base_model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
+        X_fit, y_fit,
+        eval_set=[(X_calib, y_calib)],
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
     )
 
-    # Calibrate probabilities with isotonic regression
-    # cv="prefit" uses the already-fitted base_model, no re-training
-    model = CalibratedClassifierCV(base_model, method="isotonic", cv="prefit")
-    model.fit(X_train, y_train)
-    logger.info("CalibratedClassifierCV (isotonic) fitted on training set")
+    calib_tscv = TimeSeriesSplit(n_splits=3)
+    model = CalibratedClassifierCV(base_model, method="isotonic", cv=calib_tscv)
+    model.fit(X_calib, y_calib)
+    logger.info("CalibratedClassifierCV (isotonic, cv=3-fold-ts) fitted on calib slice")
 
-    # Evaluate with prob threshold
     y_prob = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, y_prob)
     logger.info(f"LGB calibrated ROC-AUC (test): {auc:.4f}")
@@ -106,10 +98,9 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     logger.info(f"LGB threshold={threshold:.2f}  predicted positives: {y_pred.sum()} / {len(y_pred)}")
 
     if y_pred.sum() == 0:
-        # Find threshold at target recall
-        softer = float(np.percentile(y_prob, 80))  # top-20% by prob = long
+        softer = float(np.percentile(y_prob, 80))
         y_pred = (y_prob >= softer).astype(int)
-        logger.warning(f"Recall(1)=0 at {threshold:.2f} — using percentile-80 threshold {softer:.3f}")
+        logger.warning(f"Recall(1)=0 at {threshold:.2f} — using p80 threshold {softer:.3f}")
 
     logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
 

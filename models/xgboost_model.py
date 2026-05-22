@@ -1,8 +1,8 @@
-"""XGBoost classifier with Optuna + SHAP + CalibratedClassifierCV.
+"""XGBoost classifier with Optuna + SHAP + manual prob calibration.
 
-Same calibration fix as lightgbm_model.py:
-  Optuna CV metric -> roc_auc
-  Final model wrapped with CalibratedClassifierCV (isotonic)
+Fix: cv='prefit' unsupported in this sklearn version.
+Instead: keep a held-out calibration slice (last 20% of train set)
+and fit CalibratedClassifierCV with cv=3 on the remaining 80%.
 """
 import numpy as np
 import pandas as pd
@@ -54,9 +54,8 @@ def train_xgboost(df: pd.DataFrame, label_col: str = "y_binary"):
             "random_state":      42,
             "n_jobs":            -1,
         }
-        model = xgb.XGBClassifier(**params)
-        # roc_auc: threshold-free, optimises probability separation
-        scores = cross_val_score(model, X_train, y_train,
+        m = xgb.XGBClassifier(**params)
+        scores = cross_val_score(m, X_train, y_train,
                                  cv=tscv, scoring="roc_auc", n_jobs=1)
         return scores.mean()
 
@@ -72,19 +71,26 @@ def train_xgboost(df: pd.DataFrame, label_col: str = "y_binary"):
         "n_jobs": -1,
     }
 
+    # Split train into fit_set (80%) + calib_set (20%) for calibration
+    calib_split = int(len(X_train) * 0.8)
+    X_fit, X_calib = X_train[:calib_split], X_train[calib_split:]
+    y_fit, y_calib = y_train[:calib_split], y_train[calib_split:]
+
     base_model = xgb.XGBClassifier(**best_params)
     base_model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
+        X_fit, y_fit,
+        eval_set=[(X_calib, y_calib)],
         verbose=False,
     )
 
-    # Calibrate probabilities
-    model = CalibratedClassifierCV(base_model, method="isotonic", cv="prefit")
-    model.fit(X_train, y_train)
-    logger.info("CalibratedClassifierCV (isotonic) fitted")
+    # CalibratedClassifierCV with cv=3 on the calibration slice
+    # This fits 3 internal folds — time-ordered data, so we use shuffle=False default
+    calib_tscv = TimeSeriesSplit(n_splits=3)
+    model = CalibratedClassifierCV(base_model, method="isotonic", cv=calib_tscv)
+    model.fit(X_calib, y_calib)
+    logger.info("CalibratedClassifierCV (isotonic, cv=3-fold-ts) fitted on calib slice")
 
-    # Evaluate
+    # Evaluate on held-out test
     y_prob = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, y_prob)
     logger.info(f"XGB calibrated ROC-AUC (test): {auc:.4f}")
@@ -98,13 +104,13 @@ def train_xgboost(df: pd.DataFrame, label_col: str = "y_binary"):
     if y_pred.sum() == 0:
         softer = float(np.percentile(y_prob, 80))
         y_pred = (y_prob >= softer).astype(int)
-        logger.warning(f"Recall(1)=0 at {threshold:.2f} — using percentile-80 threshold {softer:.3f}")
+        logger.warning(f"Recall(1)=0 at {threshold:.2f} — using p80 threshold {softer:.3f}")
 
     logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
 
-    # SHAP on base model (before calibration wrapper)
+    # SHAP on base model (unwrapped)
     explainer = shap.TreeExplainer(base_model)
-    shap_vals = explainer.shap_values(X_train)
+    shap_vals = explainer.shap_values(X_fit)
     shap_imp = pd.Series(
         np.abs(shap_vals).mean(axis=0),
         index=feature_cols,
