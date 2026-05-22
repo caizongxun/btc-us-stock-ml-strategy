@@ -4,6 +4,8 @@ Key design decisions:
 - BTC uses 4h bars; stock/macro data is daily → forward-filled to 4h index.
 - SHAP-based feature selection keeps top CFG.top_k_features to maintain
   a healthy sample:feature ratio (target ≥ 10:1).
+- SIGNAL_COLS are always preserved after SHAP selection so multi_signal
+  sub-signals always have their required columns available.
 - GLD/TLT return features are produced by cross_asset_features — no duplication here.
 """
 import pandas as pd
@@ -20,12 +22,23 @@ from features.technical_features import add_technical_features
 from features.regime_features import detect_regime
 from config import CFG
 
+# Columns required by strategy/multi_signal.py — must survive SHAP pruning.
+# Add any new sub-signal columns here if multi_signal.py is extended.
+SIGNAL_COLS = [
+    "btc_trend_score",      # technical_features: EMA alignment 0-3
+    "btc_regime_bear",      # regime_features: HMM bear state flag
+    "btc_regime_sideways",  # regime_features: HMM sideways state flag
+    "btc_rsi14_ob",         # technical_features: RSI>70 flag
+    "btc_vol_ma_ratio_14d", # volatility_features: volume surge
+    "btc_vol_ma_ratio_7d",  # volatility_features: fallback
+    "btc_SPY_corr_30d",     # cross_asset_features: BTC-SPY 30d rolling corr
+    "fg_value",             # fetch_onchain: fear & greed index value
+    "risk_on_score",        # cross_asset_features: composite risk-on percentile
+]
+
 
 def _align_daily_to_intraday(daily_df: pd.DataFrame, target_index: pd.DatetimeIndex) -> pd.DataFrame:
-    """Forward-fill daily data onto an intraday index.
-    Each intraday bar inherits the value of the most recent completed daily bar,
-    preventing any lookahead (we only use data that was *available* at bar open).
-    """
+    """Forward-fill daily data onto an intraday index."""
     combined = daily_df.reindex(daily_df.index.union(target_index))
     combined = combined.ffill()
     return combined.reindex(target_index)
@@ -38,16 +51,15 @@ def build_feature_matrix(
 ) -> pd.DataFrame:
     """
     Returns a fully-featured, SHAP-selected DataFrame with label columns 'y' and 'y_binary'.
-    Label: +1 (long), 0 (flat), -1 (short) based on forward return over target_days bars.
+    Signal columns (SIGNAL_COLS) are always preserved regardless of SHAP rank.
     """
     logger.info("Fetching data...")
-    btc = fetch_btc_ohlcv()          # 4h bars
-    stocks = fetch_stocks()          # daily bars
-    fg = fetch_fear_greed()          # daily sentiment
+    btc = fetch_btc_ohlcv()
+    stocks = fetch_stocks()
+    fg = fetch_fear_greed()
 
     btc_index = btc.index
 
-    # --- BTC features (native 4h resolution) ---
     logger.info("Building BTC features...")
     df = btc.copy()
     df = add_price_features(df, prefix="btc")
@@ -55,11 +67,7 @@ def build_feature_matrix(
     df = add_technical_features(df, prefix="btc")
     df = detect_regime(df, prefix="btc")
 
-    # --- Daily → 4h alignment helper ---
     def join_daily(feat_df: pd.DataFrame) -> None:
-        """Align daily feature DataFrame onto BTC 4h index and left-join.
-        Automatically drops any columns already present in df to prevent overlap.
-        """
         nonlocal df
         overlap = [c for c in feat_df.columns if c in df.columns]
         if overlap:
@@ -69,12 +77,10 @@ def build_feature_matrix(
         aligned = _align_daily_to_intraday(feat_df, btc_index)
         df = df.join(aligned, how="left")
 
-    # --- VIX features ---
     if "^VIX" in stocks:
         vix_feats = add_vix_features(stocks["^VIX"])
         join_daily(vix_feats)
 
-    # --- SPY features ---
     if "SPY" in stocks:
         spy = stocks["SPY"].copy()
         spy = add_price_features(spy, prefix="spy")
@@ -83,30 +89,25 @@ def build_feature_matrix(
         spy_feats = spy.drop(columns=["open", "high", "low", "close", "volume"], errors="ignore")
         join_daily(spy_feats)
 
-    # --- QQQ features ---
     if "QQQ" in stocks:
         qqq = stocks["QQQ"].copy()
         qqq = add_price_features(qqq, prefix="qqq")
         qqq_feats = qqq.drop(columns=["open", "high", "low", "close", "volume"], errors="ignore")
         join_daily(qqq_feats)
 
-    # --- Cross-asset features (daily, then align to 4h) ---
-    # NOTE: cross_asset_features already includes GLD/TLT ret_Nd columns.
-    # Do NOT add separate GLD/TLT blocks to avoid column overlap.
     logger.info("Building cross-asset features...")
     cross = add_cross_asset_features(btc, {k: v for k, v in stocks.items() if k != "^VIX"})
     if not cross.index.equals(btc_index):
         cross = _align_daily_to_intraday(cross, btc_index)
     df = df.join(cross, how="left")
 
-    # --- Fear & Greed (daily → 4h) ---
     fg_aligned = _align_daily_to_intraday(fg, btc_index)
     df = df.join(fg_aligned, how="left")
     df["fg_value"] = df["fg_value"].ffill()
     df["fg_extreme_fear"] = df["fg_extreme_fear"].ffill().fillna(0)
     df["fg_extreme_greed"] = df["fg_extreme_greed"].ffill().fillna(0)
 
-    # --- Label construction ---
+    # Label construction
     fwd_ret = btc["close"].pct_change(target_days).shift(-target_days)
     if target_asset != "BTC":
         daily_fwd = stocks[target_asset]["close"].pct_change(target_days).shift(-target_days)
@@ -115,10 +116,9 @@ def build_feature_matrix(
     df["fwd_ret"] = fwd_ret
     df["y"] = 0
     df.loc[fwd_ret > CFG.long_threshold, "y"] = 1
-    df.loc[fwd_ret < CFG.short_threshold, "y"] = -1
+    df.loc[fwd_ret < -CFG.short_threshold, "y"] = -1
     df["y_binary"] = (df["y"] == 1).astype(int)
 
-    # Drop raw OHLCV to prevent lookahead
     raw_cols = [c for c in ["open", "high", "low", "close", "volume",
                              "taker_buy_base", "taker_buy_quote", "fwd_ret"] if c in df.columns]
     df = df.drop(columns=raw_cols)
@@ -131,7 +131,6 @@ def build_feature_matrix(
     feature_cols = [c for c in df.columns if c not in ["y", "y_binary"]]
     logger.info(f"Feature matrix (raw): {df.shape[0]} rows x {len(feature_cols)} features")
 
-    # --- SHAP-based feature selection ---
     if top_k and top_k < len(feature_cols):
         df = _shap_feature_selection(df, feature_cols, top_k)
 
@@ -142,7 +141,8 @@ def build_feature_matrix(
 
 def _shap_feature_selection(df: pd.DataFrame, feature_cols: list, top_k: int) -> pd.DataFrame:
     """Quick SHAP importance pass with a lightweight XGBoost to select top_k features.
-    Uses only the first 80% of data to avoid lookahead into the test set.
+    SIGNAL_COLS are always kept regardless of their SHAP rank to ensure
+    multi_signal sub-signals always have the columns they need.
     """
     import shap
     import xgboost as xgb
@@ -173,9 +173,18 @@ def _shap_feature_selection(df: pd.DataFrame, feature_cols: list, top_k: int) ->
         index=feature_cols,
     ).sort_values(ascending=False)
 
+    # Guarantee signal cols are preserved (may already be in top_k)
+    present_signal_cols = [c for c in SIGNAL_COLS if c in feature_cols]
     top_features = importance.head(top_k).index.tolist()
-    logger.info(f"SHAP feature selection: kept top {top_k} / {len(feature_cols)} features")
+    # Merge: top SHAP + signal cols (deduped, preserve SHAP order)
+    all_keep = list(dict.fromkeys(top_features + present_signal_cols))
+
+    n_added = len([c for c in present_signal_cols if c not in top_features])
+    logger.info(
+        f"SHAP feature selection: kept top {top_k} / {len(feature_cols)} features "
+        f"+ {n_added} forced signal cols = {len(all_keep)} total"
+    )
     logger.info(f"Top 10 selected:\n{importance.head(10).to_string()}")
 
-    keep_cols = top_features + ["y", "y_binary"]
+    keep_cols = all_keep + ["y", "y_binary"]
     return df[keep_cols]
