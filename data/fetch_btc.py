@@ -4,7 +4,11 @@ URL pattern:
   monthly: .../spot/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{YYYY-MM}.zip
   daily:   .../spot/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{YYYY-MM-DD}.zip
 
-Supports any Binance kline interval: 1d, 4h, 1h, etc.
+Supports any Binance kline interval: 1d, 4h, 1h, 15m, etc.
+
+Fix (2026-05-23):
+  Cache key now includes symbol + interval + days so different intervals
+  never share the same parquet file.
 """
 import io
 import os
@@ -87,30 +91,46 @@ def fetch_btc_ohlcv(
     symbol: str = CFG.btc_symbol,
     interval: str = CFG.btc_interval,
     days: int = CFG.lookback_days,
+    force: bool = False,
 ) -> pd.DataFrame:
     """Download BTC klines via data.binance.vision.
+
     Returns DataFrame indexed by datetime (no tz) with OHLCV columns.
-    Supports any interval available on binance.vision (1d, 4h, 1h, etc.).
+    Supports any interval available on binance.vision (1d, 4h, 1h, 15m, etc.).
+
+    Cache key: {symbol}_{interval}_{days}d.parquet
+    Each unique (symbol, interval, days) combination gets its own cache file,
+    preventing cross-contamination between e.g. 4h and 15m data.
+
+    Args:
+        force: if True, delete existing cache and re-download.
     """
-    cache_path = os.path.join(CFG.data_dir, f"{symbol}_{interval}_{days}_vision.parquet")
+    # ── Cache path includes interval AND days so they never collide ──────────
+    safe_interval = interval.replace("/", "-")
+    cache_path = os.path.join(CFG.data_dir, f"{symbol}_{safe_interval}_{days}d.parquet")
     os.makedirs(CFG.data_dir, exist_ok=True)
+
+    if force and os.path.exists(cache_path):
+        os.remove(cache_path)
+        logger.info(f"Cache cleared: {cache_path}")
 
     if os.path.exists(cache_path):
         df = pd.read_parquet(cache_path)
-        logger.info(f"Loaded BTC from cache: {len(df)} rows")
+        logger.info(f"Loaded from cache [{safe_interval}]: {len(df):,} rows  "
+                    f"({df.index[0].date()} ~ {df.index[-1].date()})")
         return df
 
-    today = date.today()
+    today      = date.today()
     start_date = today - timedelta(days=days)
-    frames = []
+    frames     = []
 
     # --- Monthly ZIPs ---
     cur = date(start_date.year, start_date.month, 1)
     last_complete = date(today.year, today.month, 1) - relativedelta(months=1)
     while cur <= last_complete:
-        ym = cur.strftime("%Y-%m")
+        ym  = cur.strftime("%Y-%m")
         url = f"{BASE}/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{ym}.zip"
-        logger.info(f"Downloading monthly: {ym}")
+        logger.info(f"Downloading monthly [{interval}]: {ym}")
         part = _download_zip(url)
         if part is not None:
             frames.append(part)
@@ -127,7 +147,10 @@ def fetch_btc_ohlcv(
         cur_day += timedelta(days=1)
 
     if not frames:
-        raise RuntimeError("No data downloaded from data.binance.vision — check symbol/interval.")
+        raise RuntimeError(
+            f"No data downloaded from data.binance.vision — "
+            f"check symbol={symbol} interval={interval}."
+        )
 
     df = _parse_frames(frames)
 
@@ -136,7 +159,8 @@ def fetch_btc_ohlcv(
 
     df.to_parquet(cache_path)
     logger.info(
-        f"BTC fetched: {len(df)} rows "
-        f"({df.index[0].date()} ~ {df.index[-1].date()})"
+        f"BTC [{interval}] fetched: {len(df):,} rows  "
+        f"({df.index[0].date()} ~ {df.index[-1].date()})  "
+        f"→ cached at {cache_path}"
     )
     return df
