@@ -30,14 +30,20 @@ class Config:
     test_size: float = 0.2
 
     # --- Signal probability thresholds ---
-    # Lowered to 0.45: calibrated prob rarely exceeds 0.52 with isotonic calibration
-    # on imbalanced data (pos=14%). 0.45 captures the top decile of predictions.
-    long_prob_threshold: float = 0.45
-    short_prob_threshold: float = 0.45
+    # Set to None → models will auto-sweep calib slice for best F1-class1 threshold.
+    # Set to a float (e.g. 0.35) to override auto-sweep.
+    long_prob_threshold: float = None   # None = auto
+    short_prob_threshold: float = None  # None = auto
+
+    # Threshold sweep range when long_prob_threshold is None
+    threshold_sweep_min: float = 0.25
+    threshold_sweep_max: float = 0.60
+    threshold_sweep_steps: int = 36
 
     # --- Multi-signal voting ---
-    # Base: 5-of-9. If ml_signal fires, effective threshold drops to 4-of-9.
-    n_of_m_threshold: int = 5
+    # Lowered from 5 → 4: ML signal fire rate is only 5%, so requiring 6-of-10
+    # made it near-irrelevant. 4-of-10 keeps the composite signal more balanced.
+    n_of_m_threshold: int = 4
 
     # --- Regime ---
     n_regimes: int = 3

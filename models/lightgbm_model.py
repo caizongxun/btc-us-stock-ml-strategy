@@ -1,10 +1,9 @@
-"""LightGBM classifier with Optuna + manual prob calibration.
+"""LightGBM classifier with Optuna (average_precision objective) + calibration.
 
-Fix: pass DataFrame (not numpy array) to LGBMClassifier so that
-CalibratedClassifierCV internal CV folds always have valid feature names.
-Without this, sklearn converts to numpy inside each fold and triggers:
-  UserWarning: X does not have valid feature names, but LGBMClassifier
-               was fitted with feature names
+Changes vs previous version:
+  1. Optuna objective: roc_auc → average_precision (PR-AUC).
+  2. Auto threshold sweep on calibration slice (same logic as XGB).
+  3. DataFrame passed throughout to avoid CalibratedClassifierCV feature-name warnings.
 """
 import warnings
 import numpy as np
@@ -13,7 +12,10 @@ import lightgbm as lgb
 import optuna
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.metrics import (
+    classification_report, roc_auc_score,
+    average_precision_score, f1_score,
+)
 from loguru import logger
 import joblib, os
 from config import CFG
@@ -21,12 +23,27 @@ from config import CFG
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
+def _find_best_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Sweep thresholds on the given slice; return argmax F1 for class-1."""
+    thresholds = np.linspace(
+        CFG.threshold_sweep_min,
+        CFG.threshold_sweep_max,
+        CFG.threshold_sweep_steps,
+    )
+    best_t, best_f1 = thresholds[0], -1.0
+    for t in thresholds:
+        pred = (y_prob >= t).astype(int)
+        f1 = f1_score(y_true, pred, pos_label=1, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    logger.info(f"LGB threshold sweep → best_t={best_t:.3f}  F1-class1={best_f1:.4f}")
+    return float(best_t)
+
+
 def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     feature_cols = [c for c in df.columns if c not in ["y", "y_binary"]]
 
-    # Keep as DataFrame throughout — this is the key fix.
-    # CalibratedClassifierCV will slice rows but preserve columns,
-    # so feature names remain consistent across all CV folds.
+    # Keep as DataFrame — preserves feature names across CalibratedClassifierCV folds
     X_df = df[feature_cols].copy()
     y    = df[label_col].values
 
@@ -64,18 +81,17 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
             "verbose":           -1,
         }
         m = lgb.LGBMClassifier(**params)
-        # Suppress feature-name warnings inside CV scoring
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="X does not have valid feature names")
             scores = cross_val_score(
                 m, X_train_df, y_train,
-                cv=tscv, scoring="roc_auc", n_jobs=1,
+                cv=tscv, scoring="average_precision", n_jobs=1,
             )
         return scores.mean()
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=CFG.n_trials, show_progress_bar=True)
-    logger.info(f"LightGBM best ROC-AUC (CV): {study.best_value:.4f}")
+    logger.info(f"LightGBM best Avg-Precision (CV): {study.best_value:.4f}")
 
     best_params = {
         **study.best_params,
@@ -90,7 +106,6 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     X_fit_df,   X_calib_df = X_train_df.iloc[:calib_split], X_train_df.iloc[calib_split:]
     y_fit,      y_calib    = y_train[:calib_split],          y_train[calib_split:]
 
-    # Train base model with DataFrame so feature names are stored
     base_model = lgb.LGBMClassifier(**best_params)
     base_model.fit(
         X_fit_df, y_fit,
@@ -98,7 +113,6 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
     )
 
-    # Calibrate with DataFrame — feature names propagate into each CV fold
     calib_tscv = TimeSeriesSplit(n_splits=3)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="X does not have valid feature names")
@@ -106,22 +120,33 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
         model.fit(X_calib_df, y_calib)
     logger.info("CalibratedClassifierCV (isotonic, cv=3-fold-ts) fitted on calib slice")
 
+    # --- Auto threshold sweep on calib slice ---
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="X does not have valid feature names")
+        calib_prob = model.predict_proba(X_calib_df)[:, 1]
+    if CFG.long_prob_threshold is None:
+        threshold = _find_best_threshold(y_calib, calib_prob)
+    else:
+        threshold = CFG.long_prob_threshold
+        logger.info(f"LGB using fixed threshold={threshold:.3f} (from CFG)")
+
+    # --- Final test evaluation ---
     y_prob = model.predict_proba(X_test_df)[:, 1]
     auc    = roc_auc_score(y_test, y_prob)
-    logger.info(f"LGB calibrated ROC-AUC (test): {auc:.4f}")
+    ap     = average_precision_score(y_test, y_prob)
+    logger.info(f"LGB calibrated  ROC-AUC={auc:.4f}  Avg-Precision={ap:.4f}")
     logger.info(
         f"LGB prob stats: min={y_prob.min():.3f} max={y_prob.max():.3f} "
         f"mean={y_prob.mean():.3f} >0.5: {(y_prob>0.5).sum()}"
     )
 
-    threshold = CFG.long_prob_threshold
-    y_pred    = (y_prob >= threshold).astype(int)
-    logger.info(f"LGB threshold={threshold:.2f}  predicted positives: {y_pred.sum()} / {len(y_pred)}")
+    y_pred = (y_prob >= threshold).astype(int)
+    logger.info(f"LGB threshold={threshold:.3f}  predicted positives: {y_pred.sum()} / {len(y_pred)}")
 
     if y_pred.sum() == 0:
         softer = float(np.percentile(y_prob, 80))
         y_pred = (y_prob >= softer).astype(int)
-        logger.warning(f"Recall(1)=0 at {threshold:.2f} — using p80 threshold {softer:.3f}")
+        logger.warning(f"Recall(1)=0 at {threshold:.3f} — fallback to p80={softer:.3f}")
 
     logger.info("\n" + classification_report(y_test, y_pred, zero_division=0))
 
