@@ -6,42 +6,42 @@ class Config:
     # --- Assets ---
     btc_symbol: str = "BTCUSDT"
     stock_symbols: List[str] = field(default_factory=lambda: ["SPY", "QQQ", "^VIX", "GLD", "TLT"])
-    btc_interval: str = "4h"          # 4h candles — ~6x more samples than 1d
+    btc_interval: str = "4h"          # 4h candles
     lookback_days: int = 1500
 
     # --- Labels ---
-    target_asset: str = "BTC"         # BTC or SPY or QQQ
+    target_asset: str = "BTC"
     target_days: int = 14             # 4h bars: 14 bars ≈ 2.3 days forward
-    long_threshold: float = 0.020     # +2.0% = long  (wider band for 4h noise)
-    short_threshold: float = -0.020   # -2.0% = short
+    long_threshold: float = 0.020
+    short_threshold: float = 0.020
 
     # --- Feature windows (in bars, 4h units) ---
-    short_windows: List[int] = field(default_factory=lambda: [6, 12, 24])   # 1d, 2d, 4d
-    mid_windows: List[int]   = field(default_factory=lambda: [42, 60, 84])  # 7d, 10d, 14d
-    long_windows: List[int]  = field(default_factory=lambda: [180, 252, 360])  # 30d, 42d, 60d
+    short_windows: List[int] = field(default_factory=lambda: [6, 12, 24])
+    mid_windows: List[int]   = field(default_factory=lambda: [42, 60, 84])
+    long_windows: List[int]  = field(default_factory=lambda: [180, 252, 360])
 
     # --- Feature selection ---
-    top_k_features: int = 50          # keep top-K by SHAP importance
+    top_k_features: int = 50
 
     # --- Model ---
-    n_trials: int = 50                # Optuna trials
-    cv_splits: int = 5                # TimeSeriesSplit folds
+    n_trials: int = 50
+    cv_splits: int = 5
     early_stopping_rounds: int = 50
     test_size: float = 0.2
 
     # --- Signal probability thresholds ---
-    # Lower than default 0.60 to get non-zero recall on minority class.
-    # The soft-fallback in model files will drop further to 0.45 if still 0.
     long_prob_threshold: float = 0.52
     short_prob_threshold: float = 0.48
 
     # --- Multi-signal voting ---
-    # 3-of-8: fires when at least 3 sub-signals agree.
-    # Dynamic logic in multi_signal.py will lower this if fewer signals are available.
-    n_of_m_threshold: int = 3
+    # n_of_m_threshold=4 with 9 sub-signals:
+    #   long  = vote >= 4  (~44% of signals need to agree)
+    #   flat  = vote <  4  (stay out)
+    # No short signal — see multi_signal.py for rationale.
+    n_of_m_threshold: int = 4
 
     # --- Regime ---
-    n_regimes: int = 3                # bull / sideways / bear
+    n_regimes: int = 3
 
     # --- Paths ---
     data_dir: str = "./cache"
