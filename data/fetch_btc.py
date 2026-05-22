@@ -3,6 +3,8 @@
 URL pattern:
   monthly: .../spot/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{YYYY-MM}.zip
   daily:   .../spot/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{YYYY-MM-DD}.zip
+
+Supports any Binance kline interval: 1d, 4h, 1h, etc.
 """
 import io
 import os
@@ -27,9 +29,8 @@ KLINE_COLS = [
 NUM_COLS = ["open", "high", "low", "close", "volume", "taker_buy_base", "taker_buy_quote"]
 KEEP_COLS = ["open", "high", "low", "close", "volume", "taker_buy_base", "taker_buy_quote"]
 
-# pandas Timestamp max in ms: 2262-04-11 = 9214646400000 ms
-# Use a safe upper bound: 2100-01-01 = 4102444800000 ms
-_MS_MIN = 1_000_000_000_000   # 2001-09-09 (BTC didn't exist before 2009 anyway)
+# pandas Timestamp max in ms — safe upper bound: 2100-01-01
+_MS_MIN = 1_000_000_000_000   # 2001-09-09
 _MS_MAX = 4_102_444_800_000   # 2100-01-01
 
 
@@ -48,7 +49,7 @@ def _download_zip(url: str) -> pd.DataFrame | None:
                     header=None,
                     names=KLINE_COLS,
                     dtype=str,
-                    on_bad_lines="skip",   # skip any malformed rows
+                    on_bad_lines="skip",
                 )
         return df
     except Exception as e:
@@ -60,23 +61,18 @@ def _parse_frames(frames: list) -> pd.DataFrame:
     """Concatenate raw string frames, sanitize open_time, build DatetimeIndex."""
     df = pd.concat(frames, ignore_index=True)
 
-    # --- Sanitize open_time ---
     df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
     df = df.dropna(subset=["open_time"])
     df["open_time"] = df["open_time"].astype(np.int64)
 
-    # Drop rows where open_time is out of realistic ms bounds
-    # (catches close_time bleed, header rows, or garbage values)
     mask = (df["open_time"] >= _MS_MIN) & (df["open_time"] <= _MS_MAX)
     n_dropped = (~mask).sum()
     if n_dropped:
         logger.warning(f"Dropped {n_dropped} rows with out-of-range open_time")
     df = df[mask].copy()
 
-    # --- Parse datetime (safe now) ---
     df["date"] = pd.to_datetime(df["open_time"], unit="ms")
 
-    # --- Numeric columns ---
     for col in NUM_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -93,8 +89,8 @@ def fetch_btc_ohlcv(
     days: int = CFG.lookback_days,
 ) -> pd.DataFrame:
     """Download BTC klines via data.binance.vision.
-    Returns DataFrame indexed by date (no tz) with columns:
-      open, high, low, close, volume, taker_buy_base, taker_buy_quote
+    Returns DataFrame indexed by datetime (no tz) with OHLCV columns.
+    Supports any interval available on binance.vision (1d, 4h, 1h, etc.).
     """
     cache_path = os.path.join(CFG.data_dir, f"{symbol}_{interval}_{days}_vision.parquet")
     os.makedirs(CFG.data_dir, exist_ok=True)
@@ -135,7 +131,6 @@ def fetch_btc_ohlcv(
 
     df = _parse_frames(frames)
 
-    # Trim to requested lookback
     cutoff = pd.Timestamp(today - timedelta(days=days))
     df = df[df.index >= cutoff]
 
