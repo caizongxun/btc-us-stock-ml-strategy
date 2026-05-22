@@ -40,15 +40,20 @@ def main():
         logger.info("Regime detection: done (embedded in features)")
 
     if args.mode in ["full", "rules_only"]:
-        # Step 2: Train XGBoost — now returns best_threshold
+        # Step 2: Train XGBoost — returns (model, shap_imp, test_tuple, best_threshold)
         logger.info("Training XGBoost...")
         from models.xgboost_model import train_xgboost
         xgb_model, shap_imp, (X_test, y_test, y_prob), xgb_threshold = train_xgboost(df)
 
-        # Step 3: Train LightGBM
+        # Step 3: Train LightGBM — returns (model, lgb_imp, best_threshold)
         logger.info("Training LightGBM...")
         from models.lightgbm_model import train_lightgbm
-        lgb_model, lgb_imp = train_lightgbm(df)
+        lgb_result = train_lightgbm(df)
+        if len(lgb_result) == 3:
+            lgb_model, lgb_imp, lgb_threshold = lgb_result
+        else:
+            lgb_model, lgb_imp = lgb_result
+            lgb_threshold = None
 
         # Step 4: Mine binary rules
         logger.info("Mining binary rules...")
@@ -91,6 +96,8 @@ def main():
             top_features=top_features,
             shap_importance=shap_imp,
             test_f1=rule_result["test_f1"],
+            xgb_threshold=xgb_threshold,
+            lgb_threshold=lgb_threshold,
         )
 
         # Save summary
@@ -101,6 +108,7 @@ def main():
             "rule_f1":              rule_result["test_f1"],
             "rule_thresholds":      rule_result["thresholds"],
             "xgb_threshold":        xgb_threshold,
+            "lgb_threshold":        lgb_threshold,
         }
         with open(os.path.join(CFG.output_dir, "pipeline_summary.json"), "w") as f:
             json.dump(summary, f, indent=2, default=str)
