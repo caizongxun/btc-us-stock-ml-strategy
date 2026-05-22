@@ -4,6 +4,7 @@ Key design decisions:
 - BTC uses 4h bars; stock/macro data is daily → forward-filled to 4h index.
 - SHAP-based feature selection keeps top CFG.top_k_features to maintain
   a healthy sample:feature ratio (target ≥ 10:1).
+- GLD/TLT return features are produced by cross_asset_features — no duplication here.
 """
 import pandas as pd
 import numpy as np
@@ -25,7 +26,6 @@ def _align_daily_to_intraday(daily_df: pd.DataFrame, target_index: pd.DatetimeIn
     Each intraday bar inherits the value of the most recent completed daily bar,
     preventing any lookahead (we only use data that was *available* at bar open).
     """
-    # Reindex to union, then ffill, then select only the target bars
     combined = daily_df.reindex(daily_df.index.union(target_index))
     combined = combined.ffill()
     return combined.reindex(target_index)
@@ -57,8 +57,15 @@ def build_feature_matrix(
 
     # --- Daily → 4h alignment helper ---
     def join_daily(feat_df: pd.DataFrame) -> None:
-        """Align daily feature DataFrame onto BTC 4h index and left-join."""
+        """Align daily feature DataFrame onto BTC 4h index and left-join.
+        Automatically drops any columns already present in df to prevent overlap.
+        """
         nonlocal df
+        overlap = [c for c in feat_df.columns if c in df.columns]
+        if overlap:
+            feat_df = feat_df.drop(columns=overlap)
+        if feat_df.empty:
+            return
         aligned = _align_daily_to_intraday(feat_df, btc_index)
         df = df.join(aligned, how="left")
 
@@ -83,11 +90,11 @@ def build_feature_matrix(
         qqq_feats = qqq.drop(columns=["open", "high", "low", "close", "volume"], errors="ignore")
         join_daily(qqq_feats)
 
-    # --- Cross-asset features (daily, then align) ---
+    # --- Cross-asset features (daily, then align to 4h) ---
+    # NOTE: cross_asset_features already includes GLD/TLT ret_Nd columns.
+    # Do NOT add separate GLD/TLT blocks to avoid column overlap.
     logger.info("Building cross-asset features...")
     cross = add_cross_asset_features(btc, {k: v for k, v in stocks.items() if k != "^VIX"})
-    # cross is daily-indexed (computed on daily BTC close resampled inside)
-    # if cross index matches btc_index it's already 4h; otherwise align
     if not cross.index.equals(btc_index):
         cross = _align_daily_to_intraday(cross, btc_index)
     df = df.join(cross, how="left")
@@ -99,18 +106,7 @@ def build_feature_matrix(
     df["fg_extreme_fear"] = df["fg_extreme_fear"].ffill().fillna(0)
     df["fg_extreme_greed"] = df["fg_extreme_greed"].ffill().fillna(0)
 
-    # --- GLD / TLT individual return features ---
-    for sym in ["GLD", "TLT"]:
-        if sym in stocks:
-            s = stocks[sym]["close"].rename(f"{sym}_close")
-            s_df = s.to_frame()
-            for w in [1, 5, 10, 20]:
-                s_df[f"{sym}_ret_{w}d"] = s_df[f"{sym}_close"].pct_change(w)
-            s_df = s_df.drop(columns=[f"{sym}_close"])
-            join_daily(s_df)
-
     # --- Label construction ---
-    # Use native 4h close; target_days is number of 4h bars forward
     fwd_ret = btc["close"].pct_change(target_days).shift(-target_days)
     if target_asset != "BTC":
         daily_fwd = stocks[target_asset]["close"].pct_change(target_days).shift(-target_days)
@@ -127,7 +123,6 @@ def build_feature_matrix(
                              "taker_buy_base", "taker_buy_quote", "fwd_ret"] if c in df.columns]
     df = df.drop(columns=raw_cols)
 
-    # Drop rows with NaN label or >50% NaN features
     df = df.dropna(subset=["y", "y_binary"])
     thresh = int(0.5 * len(df.columns))
     df = df.dropna(thresh=thresh)
