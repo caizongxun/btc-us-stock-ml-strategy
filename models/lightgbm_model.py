@@ -1,8 +1,12 @@
 """LightGBM classifier with Optuna + manual prob calibration.
 
-Fix: cv='prefit' unsupported in this sklearn version.
-Same pattern as xgboost_model.py: fit on 80% of train, calibrate on 20%.
+Fix: pass DataFrame (not numpy array) to LGBMClassifier so that
+CalibratedClassifierCV internal CV folds always have valid feature names.
+Without this, sklearn converts to numpy inside each fold and triggers:
+  UserWarning: X does not have valid feature names, but LGBMClassifier
+               was fitted with feature names
 """
+import warnings
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
@@ -19,19 +23,25 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
     feature_cols = [c for c in df.columns if c not in ["y", "y_binary"]]
-    X = df[feature_cols].values
-    y = df[label_col].values
 
-    split_idx = int(len(X) * (1 - CFG.test_size))
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
+    # Keep as DataFrame throughout — this is the key fix.
+    # CalibratedClassifierCV will slice rows but preserve columns,
+    # so feature names remain consistent across all CV folds.
+    X_df = df[feature_cols].copy()
+    y    = df[label_col].values
+
+    split_idx = int(len(X_df) * (1 - CFG.test_size))
+    X_train_df, X_test_df = X_df.iloc[:split_idx], X_df.iloc[split_idx:]
+    y_train,    y_test     = y[:split_idx],          y[split_idx:]
 
     neg = (y_train == 0).sum()
     pos = (y_train == 1).sum()
     spw = neg / pos if pos > 0 else 1.0
     logger.info(f"LGB scale_pos_weight (auto): {spw:.3f}  (neg={neg}, pos={pos})")
-    logger.info(f"LGB label dist  train: pos={pos} ({100*pos/(neg+pos):.1f}%)  "
-                f"test: pos={(y_test==1).sum()} ({100*(y_test==1).mean():.1f}%)")
+    logger.info(
+        f"LGB label dist  train: pos={pos} ({100*pos/(neg+pos):.1f}%)  "
+        f"test: pos={(y_test==1).sum()} ({100*(y_test==1).mean():.1f}%)"
+    )
 
     tscv = TimeSeriesSplit(n_splits=CFG.cv_splits)
 
@@ -50,12 +60,17 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
             "scale_pos_weight":  spw,
             "is_unbalance":      False,
             "random_state":      42,
-            "n_jobs":            -1,
+            "n_jobs":            1,
             "verbose":           -1,
         }
         m = lgb.LGBMClassifier(**params)
-        scores = cross_val_score(m, X_train, y_train,
-                                 cv=tscv, scoring="roc_auc", n_jobs=1)
+        # Suppress feature-name warnings inside CV scoring
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="X does not have valid feature names")
+            scores = cross_val_score(
+                m, X_train_df, y_train,
+                cv=tscv, scoring="roc_auc", n_jobs=1,
+            )
         return scores.mean()
 
     study = optuna.create_study(direction="maximize")
@@ -71,30 +86,36 @@ def train_lightgbm(df: pd.DataFrame, label_col: str = "y_binary"):
         "verbose": -1,
     }
 
-    calib_split = int(len(X_train) * 0.8)
-    X_fit, X_calib = X_train[:calib_split], X_train[calib_split:]
-    y_fit, y_calib = y_train[:calib_split], y_train[calib_split:]
+    calib_split = int(len(X_train_df) * 0.8)
+    X_fit_df,   X_calib_df = X_train_df.iloc[:calib_split], X_train_df.iloc[calib_split:]
+    y_fit,      y_calib    = y_train[:calib_split],          y_train[calib_split:]
 
+    # Train base model with DataFrame so feature names are stored
     base_model = lgb.LGBMClassifier(**best_params)
     base_model.fit(
-        X_fit, y_fit,
-        eval_set=[(X_calib, y_calib)],
+        X_fit_df, y_fit,
+        eval_set=[(X_calib_df, y_calib)],
         callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
     )
 
+    # Calibrate with DataFrame — feature names propagate into each CV fold
     calib_tscv = TimeSeriesSplit(n_splits=3)
-    model = CalibratedClassifierCV(base_model, method="isotonic", cv=calib_tscv)
-    model.fit(X_calib, y_calib)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="X does not have valid feature names")
+        model = CalibratedClassifierCV(base_model, method="isotonic", cv=calib_tscv)
+        model.fit(X_calib_df, y_calib)
     logger.info("CalibratedClassifierCV (isotonic, cv=3-fold-ts) fitted on calib slice")
 
-    y_prob = model.predict_proba(X_test)[:, 1]
-    auc = roc_auc_score(y_test, y_prob)
+    y_prob = model.predict_proba(X_test_df)[:, 1]
+    auc    = roc_auc_score(y_test, y_prob)
     logger.info(f"LGB calibrated ROC-AUC (test): {auc:.4f}")
-    logger.info(f"LGB prob stats: min={y_prob.min():.3f} max={y_prob.max():.3f} "
-                f"mean={y_prob.mean():.3f} >0.5: {(y_prob>0.5).sum()}")
+    logger.info(
+        f"LGB prob stats: min={y_prob.min():.3f} max={y_prob.max():.3f} "
+        f"mean={y_prob.mean():.3f} >0.5: {(y_prob>0.5).sum()}"
+    )
 
     threshold = CFG.long_prob_threshold
-    y_pred = (y_prob >= threshold).astype(int)
+    y_pred    = (y_prob >= threshold).astype(int)
     logger.info(f"LGB threshold={threshold:.2f}  predicted positives: {y_pred.sum()} / {len(y_pred)}")
 
     if y_pred.sum() == 0:
